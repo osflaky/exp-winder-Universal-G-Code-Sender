@@ -1,0 +1,37 @@
+/*
+    Copyright 2026 Joacim Breiler
+
+    This file is part of Universal Gcode Sender (UGS).
+
+    UGS is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    UGS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with UGS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package com.willwinder.universalgcodesender.firmware.grblhal.commands;
+
+import com.willwinder.universalgcodesender.firmware.grblhal.GrblHalUtils;
+
+/**
+ * Enumerates the error codes supported by the controller using the command $EE:
+ *
+ * <pre>
+ * [ERRORCODE:1|Expected command letter|G-code words consist of a letter and a value. Letter was not found.]
+ * ok
+ * </pre>
+ *
+ * @author Joacim Breiler
+ */
+public class GetErrorCodesCommand extends AbstractGetCodesCommand {
+    public GetErrorCodesCommand() {
+        super(GrblHalUtils.GRBLHAL_ERROR_CODES_COMMAND, "[ERRORCODE:");
+    }
+}

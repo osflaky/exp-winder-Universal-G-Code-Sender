@@ -1,0 +1,130 @@
+/*
+    Copyright 2023-2026 Joacim Breiler
+
+    This file is part of Universal Gcode Sender (UGS).
+
+    UGS is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    UGS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with UGS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package com.willwinder.universalgcodesender.uielements.components;
+
+import com.willwinder.universalgcodesender.model.Unit;
+import com.willwinder.universalgcodesender.uielements.TextFieldUnitFormatter;
+
+import javax.swing.JSpinner;
+import javax.swing.SpinnerNumberModel;
+import javax.swing.SwingConstants;
+import javax.swing.text.DefaultFormatterFactory;
+
+/**
+ * Spinner that shows the given unit with its abbreviation
+ *
+ * @author Joacim Breiler
+ */
+public class UnitSpinner extends JSpinner {
+
+    private final SpinnerNumberModel spinnerNumberModel;
+    private Unit units;
+
+    public UnitSpinner(double value, Unit units) {
+        this(value, units, null, null, 0.01d);
+    }
+
+    public UnitSpinner(double value, Unit units, Double minimum, Double maximum, Double stepSize) {
+        spinnerNumberModel = new SpinnerNumberModel(Double.valueOf(value), minimum, maximum, stepSize);
+        setModel(spinnerNumberModel);
+        setValue(value);
+        setUnits(units);
+    }
+
+    public void setUnits(Unit units) {
+        this.units = units;
+
+        if (units == Unit.MM) {
+            spinnerNumberModel.setStepSize(0.01);
+        } else if (units == Unit.INCH) {
+            spinnerNumberModel.setStepSize(0.001);
+        }
+
+        NumberEditor numberEditor = new NumberEditor(this);
+        numberEditor.getTextField().setFormatterFactory(new DefaultFormatterFactory(
+                new TextFieldUnitFormatter(units, 3),
+                new TextFieldUnitFormatter(units, 3),
+                new TextFieldUnitFormatter(units, 3, false)));
+        numberEditor.getTextField().setHorizontalAlignment(SwingConstants.LEFT);
+        setEditor(numberEditor);
+    }
+
+    public Unit getUnits() {
+        return units;
+    }
+
+    public double getDoubleValue() {
+        return (Double) getModel().getValue();
+    }
+
+    /**
+     * Sets the value given in the supplied units, converting it to the units of this spinner.
+     *
+     * @param value the value to set
+     * @param units the units of the given value
+     */
+    public void setValue(double value, Unit units) {
+        setValue(value * units.convertTo(this.units));
+    }
+
+    /**
+     * Returns the current value converted to the given units.
+     *
+     * @param units the units to convert the value to
+     * @return the value in the given units
+     */
+    public double getDoubleValue(Unit units) {
+        return getDoubleValue() * this.units.convertTo(units);
+    }
+
+
+    public void setMinimum(double min) {
+        spinnerNumberModel.setMinimum(min);
+        if (getDoubleValue() < min) {
+            setValue(min);
+        }
+    }
+
+    public void setMaximum(double max) {
+        spinnerNumberModel.setMaximum(max);
+        if (getDoubleValue() > max) {
+            setValue(max);
+        }
+    }
+
+    @Override
+    public Object getNextValue() {
+        if (super.getNextValue() == null) {
+            return null;
+        }
+
+        double power = 1d / spinnerNumberModel.getStepSize().doubleValue();
+        return Math.round((Double) super.getNextValue() * power) / power;
+    }
+
+    @Override
+    public Object getPreviousValue() {
+        if (super.getPreviousValue() == null) {
+            return null;
+        }
+
+        double power = 1d / spinnerNumberModel.getStepSize().doubleValue();
+        return Math.round((Double) super.getPreviousValue() * power) / power;
+    }
+}

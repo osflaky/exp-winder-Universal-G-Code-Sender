@@ -1,0 +1,670 @@
+/*
+    Copyright 2026 Joacim Breiler
+
+    This file is part of Universal Gcode Sender (UGS).
+
+    UGS is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    UGS is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with UGS.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package com.willwinder.universalgcodesender.fx.component.designer;
+
+import com.willwinder.ugs.designer.actions.ChangeFontAction;
+import com.willwinder.ugs.designer.actions.ChangeTextAction;
+import com.willwinder.ugs.designer.actions.MoveAction;
+import com.willwinder.ugs.designer.actions.ResizeAction;
+import com.willwinder.ugs.designer.actions.RotateAction;
+import com.willwinder.ugs.designer.actions.UndoableAction;
+import com.willwinder.ugs.designer.entities.Anchor;
+import com.willwinder.ugs.designer.entities.Entity;
+import com.willwinder.ugs.designer.entities.EntityListener;
+import com.willwinder.ugs.designer.entities.EventType;
+import com.willwinder.ugs.designer.entities.EntitySetting;
+import com.willwinder.ugs.designer.entities.cuttable.Cuttable;
+import com.willwinder.ugs.designer.entities.cuttable.CutType;
+import com.willwinder.ugs.designer.entities.cuttable.Direction;
+import com.willwinder.ugs.designer.entities.cuttable.PlungeType;
+import com.willwinder.ugs.designer.entities.cuttable.Rectangle;
+import com.willwinder.ugs.designer.entities.cuttable.Text;
+import com.willwinder.ugs.designer.entities.cuttable.ToolPathDirection;
+import com.willwinder.ugs.designer.entities.selection.SelectionListener;
+import com.willwinder.ugs.designer.entities.selection.SelectionManager;
+import com.willwinder.ugs.designer.logic.ControllerFactory;
+import com.willwinder.ugs.designer.model.Size;
+import com.willwinder.universalgcodesender.fx.actions.Action;
+import com.willwinder.universalgcodesender.fx.actions.DesignFlipHorizontalAction;
+import com.willwinder.universalgcodesender.fx.actions.DesignFlipVerticalAction;
+import com.willwinder.universalgcodesender.fx.component.CollapsibleTitledPane;
+import com.willwinder.universalgcodesender.fx.control.ActionButton;
+import com.willwinder.universalgcodesender.fx.control.SwitchButton;
+import com.willwinder.universalgcodesender.fx.control.UnitTextField;
+import com.willwinder.universalgcodesender.fx.helper.Colors;
+import com.willwinder.universalgcodesender.fx.helper.SvgLoader;
+import com.willwinder.universalgcodesender.model.Unit;
+import com.willwinder.universalgcodesender.utils.Debouncer;
+import javafx.application.Platform;
+import javafx.beans.property.BooleanProperty;
+import javafx.beans.property.DoubleProperty;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.beans.property.SimpleDoubleProperty;
+import javafx.geometry.Pos;
+import javafx.collections.FXCollections;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.ListCell;
+import javafx.scene.control.Label;
+import javafx.scene.control.TextField;
+import javafx.scene.control.ToggleButton;
+import javafx.scene.control.Tooltip;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.VBox;
+import javafx.scene.text.Font;
+import javafx.util.Duration;
+
+import java.awt.GraphicsEnvironment;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.ToDoubleFunction;
+import java.util.stream.Stream;
+
+/**
+ * Floating panel that displays the entity settings common to all selected Cuttable
+ * entities, and applies edits to the entire selection. Hidden when no Cuttable is
+ * selected.
+ */
+public class EntitySettingsPanel extends VBox {
+    private static final List<EntitySetting> SPECIAL_KEYS = List.of(
+            EntitySetting.TEXT,
+            EntitySetting.FONT_FAMILY);
+
+    private static final List<EntitySetting> TRANSFORM_KEYS = List.of(
+            EntitySetting.POSITION_X,
+            EntitySetting.POSITION_Y,
+            EntitySetting.WIDTH,
+            EntitySetting.HEIGHT,
+            EntitySetting.ROTATION,
+            EntitySetting.CORNER_RADIUS);
+
+    private static final List<EntitySetting> CUT_KEYS = List.of(
+            EntitySetting.CUT_TYPE,
+            EntitySetting.START_DEPTH,
+            EntitySetting.TARGET_DEPTH,
+            EntitySetting.SPINDLE_SPEED,
+            EntitySetting.FEED_RATE,
+            EntitySetting.PASSES,
+            EntitySetting.LEAD_IN_PERCENT,
+            EntitySetting.TOOL_PATH_ANGLE,
+            EntitySetting.DIRECTION,
+            EntitySetting.TOOL_PATH_DIRECTION,
+            EntitySetting.PLUNGE_TYPE,
+            EntitySetting.TABS,
+            EntitySetting.TAB_COUNT);
+
+    // Pure transforms never change the set of controls, so they only need a cheap value refresh
+    // rather than a full (and, during a drag, sluggish) structural rebuild.
+    private static final EnumSet<EventType> TRANSFORM_EVENTS = EnumSet.of(
+            EventType.MOVED, EventType.RESIZED, EventType.ROTATED);
+    public static final int SPACING = 12;
+    private static final String MIXED_VALUE_PROMPT = "—";
+
+    private final SelectionManager selectionManager;
+    private final BooleanProperty aspectRatioLocked = new SimpleBooleanProperty(false);
+    private final Map<Entity, Double> aspectRatios = new HashMap<>();
+    /**
+     * Shared across all rows so every label grows to the width of the longest label. Kept for the
+     * lifetime of the panel (not per rebuild) so labels don't collapse and re-grow on every event.
+     */
+    private final DoubleProperty labelWidth = new SimpleDoubleProperty(0);
+
+    /**
+     * Per-field updaters that re-read the current entity values into the existing controls, rebuilt
+     * alongside the rows. Used to refresh values during transforms without recreating the UI.
+     */
+    private final List<Runnable> valueRefreshers = new ArrayList<>();
+    private final EditGuard editGuard = new EditGuard();
+    private final EntitySettingsControlFactory controls = new EntitySettingsControlFactory(editGuard, valueRefreshers::add);
+
+    /**
+     * Coalesce a burst of transform events (e.g. during a drag) into a single value refresh on the
+     * next pulse, so we update the fields at most once per frame instead of once per event.
+     */
+    private final Debouncer valueRefresh = new Debouncer(Platform::runLater, () -> valueRefreshers.forEach(Runnable::run));
+    private Anchor positionAnchor = Anchor.BOTTOM_LEFT;
+
+    public EntitySettingsPanel() {
+        getStyleClass().add("entity-settings-panel");
+        setSpacing(12);
+        setPadding(new javafx.geometry.Insets(12));
+
+        this.selectionManager = ControllerFactory.getController().getSelectionManager();
+        SelectionListener selectionListener = event -> Platform.runLater(this::rebuild);
+        selectionManager.addSelectionListener(selectionListener);
+
+        // Refresh values (not structure) when the entities themselves change.
+        EntityListener entityListener = event -> {
+            if (editGuard.isActive()) return;
+            if (TRANSFORM_EVENTS.contains(event.getType())) {
+                valueRefresh.call();
+            } else if (event.getType() == EventType.SETTINGS_CHANGED) {
+                Platform.runLater(this::rebuild);
+            }
+        };
+        ControllerFactory.getController().getModel().getRootEntity().addListener(entityListener);
+        selectionManager.addListener(entityListener);
+
+        rebuild();
+    }
+
+    private void rebuild() {
+        List<Cuttable> cuttables = selectionManager.getSelection().stream()
+                .filter(Cuttable.class::isInstance)
+                .map(Cuttable.class::cast)
+                .toList();
+
+        getChildren().clear();
+        valueRefreshers.clear();
+        if (cuttables.isEmpty()) {
+            Label placeholder = new Label("Select a shape to edit its properties.");
+            placeholder.setWrapText(true);
+            getChildren().add(placeholder);
+            return;
+        }
+
+        Set<EntitySetting> common = intersection(cuttables);
+
+        VBox transformRows = buildRows(TRANSFORM_KEYS, common, cuttables, labelWidth);
+        if (!transformRows.getChildren().isEmpty()) {
+            getChildren().add(new CollapsibleTitledPane("Transform", transformRows));
+        }
+
+        VBox textRows = buildTextRows(common, cuttables, labelWidth);
+        if (!textRows.getChildren().isEmpty()) {
+            getChildren().add(new CollapsibleTitledPane("Text", textRows));
+        }
+
+        Set<EntitySetting> cutSettings = new LinkedHashSet<>(common);
+        cutSettings.retainAll(commonCutTypeSettings(cuttables));
+        if (cuttables.stream().noneMatch(Cuttable::hasTabs)) {
+            cutSettings.remove(EntitySetting.TAB_COUNT);
+        }
+        VBox cutRows = buildRows(CUT_KEYS, cutSettings, cuttables, labelWidth);
+        if (!cutRows.getChildren().isEmpty()) {
+            getChildren().add(new CollapsibleTitledPane("Cut", cutRows));
+        }
+    }
+
+    private static Set<EntitySetting> intersection(List<Cuttable> cuttables) {
+        return intersect(cuttables.stream().map(Cuttable::getSettings));
+    }
+
+    private static Set<EntitySetting> commonCutTypeSettings(List<Cuttable> cuttables) {
+        return intersect(cuttables.stream().map(cuttable -> cuttable.getCutType().getSettings()));
+    }
+
+    private static Set<EntitySetting> intersect(Stream<? extends Collection<EntitySetting>> settings) {
+        return settings
+                .<Set<EntitySetting>>map(LinkedHashSet::new)
+                .reduce((accumulated, next) -> {
+                    accumulated.retainAll(next);
+                    return accumulated;
+                })
+                .orElseGet(LinkedHashSet::new);
+    }
+
+    private VBox buildRows(List<EntitySetting> keys, Set<EntitySetting> common, List<Cuttable> cuttables, DoubleProperty labelWidth) {
+        TransformTarget target = transformTarget(cuttables);
+        boolean groupPosition = common.contains(EntitySetting.POSITION_X) && common.contains(EntitySetting.POSITION_Y);
+        boolean positionGroupAdded = false;
+        boolean groupSize = common.contains(EntitySetting.WIDTH) && common.contains(EntitySetting.HEIGHT);
+        boolean sizeGroupAdded = false;
+
+        VBox rows = new VBox(SPACING);
+        for (EntitySetting key : keys) {
+            if (!common.contains(key)) continue;
+
+            // Group X and Y into a single block so the anchor selector can sit to the right of both
+            // rows. The block takes the position of whichever key comes first.
+            if (groupPosition && (key == EntitySetting.POSITION_X || key == EntitySetting.POSITION_Y)) {
+                if (!positionGroupAdded) {
+                    rows.getChildren().add(buildPositionGroup(target, labelWidth));
+                    positionGroupAdded = true;
+                }
+                continue;
+            }
+
+            // Group width and height into a single block so the aspect-ratio lock can sit to the
+            // right of both rows. The block takes the position of whichever key comes first.
+            if (groupSize && (key == EntitySetting.WIDTH || key == EntitySetting.HEIGHT)) {
+                if (!sizeGroupAdded) {
+                    rows.getChildren().add(buildSizeGroup(target, labelWidth));
+                    sizeGroupAdded = true;
+                }
+                continue;
+            }
+
+            // Put the flip buttons to the right of the rotation field.
+            if (key == EntitySetting.ROTATION) {
+                rows.getChildren().add(buildRotationGroup(target, labelWidth));
+                continue;
+            }
+
+            Region control = buildControl(key, cuttables);
+            if (control != null) {
+                rows.getChildren().add(new EntitySettingsRow(labelWidth, key.getLabel(), control));
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * A single selected entity is edited directly. A group or several entities are edited through
+     * the selection as a whole, so the fields show the bounds of the selection rather than the
+     * mixed values of its members, and the undo actions apply to the members that were selected.
+     */
+    private TransformTarget transformTarget(List<Cuttable> cuttables) {
+        if (cuttables.size() == 1) {
+            return new TransformTarget(cuttables.getFirst(), null);
+        }
+        return new TransformTarget(selectionManager, new ArrayList<>(selectionManager.getSelection()));
+    }
+
+    /**
+     * The text and font of the selected text entities. The keys are only common when every
+     * selected entity is a text, so the rows are absent for mixed selections.
+     */
+    private VBox buildTextRows(Set<EntitySetting> common, List<Cuttable> cuttables, DoubleProperty labelWidth) {
+        VBox rows = new VBox(SPACING);
+        List<Text> texts = cuttables.stream()
+                .filter(Text.class::isInstance)
+                .map(Text.class::cast)
+                .toList();
+        for (EntitySetting key : SPECIAL_KEYS) {
+            if (!common.contains(key) || texts.isEmpty()) {
+                continue;
+            }
+            Region control = switch (key) {
+                case TEXT -> textControl(texts);
+                case FONT_FAMILY -> fontControl(texts);
+                default -> null;
+            };
+            if (control != null) {
+                rows.getChildren().add(new EntitySettingsRow(labelWidth, key.getLabel(), control));
+            }
+        }
+        return rows;
+    }
+
+    private TextField textControl(List<Text> texts) {
+        String shared = sharedValue(texts, Text::getText);
+        TextField field = new TextField(shared == null ? "" : shared);
+        field.setPromptText(shared == null ? MIXED_VALUE_PROMPT : "");
+        Runnable commit = () -> {
+            String value = field.getText();
+            if (value == null || (shared == null && value.isEmpty())) {
+                return;
+            }
+            applyTextChange(texts, text -> value.equals(text.getText()) ? null : new ChangeTextAction(text, value));
+        };
+        field.setOnAction(event -> commit.run());
+        field.focusedProperty().addListener((observable, wasFocused, isFocused) -> {
+            if (Boolean.FALSE.equals(isFocused)) {
+                commit.run();
+            }
+        });
+        return field;
+    }
+
+    private ComboBox<String> fontControl(List<Text> texts) {
+        ComboBox<String> combo = new ComboBox<>(FXCollections.observableArrayList(
+                GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames()));
+        combo.setMaxWidth(Double.MAX_VALUE);
+        combo.setCellFactory(list -> new FontListCell());
+        combo.setButtonCell(new FontListCell());
+        String shared = sharedValue(texts, Text::getFontFamily);
+        combo.setValue(shared);
+        combo.setPromptText(shared == null ? MIXED_VALUE_PROMPT : "");
+        combo.valueProperty().addListener((observable, oldValue, newValue) -> {
+            if (newValue != null && !newValue.equals(oldValue)) {
+                applyTextChange(texts, text -> newValue.equals(text.getFontFamily()) ? null : new ChangeFontAction(text, newValue));
+            }
+        });
+        return combo;
+    }
+
+    private static <T> T sharedValue(List<Text> texts, Function<Text, T> getter) {
+        List<T> distinct = texts.stream().map(getter).distinct().toList();
+        return distinct.size() == 1 ? distinct.get(0) : null;
+    }
+
+    /**
+     * Applies one change per text that actually changes and records them as a single undo step.
+     */
+    private void applyTextChange(List<Text> texts, Function<Text, UndoableAction> actionFor) {
+        List<UndoableAction> actions = texts.stream().map(actionFor).filter(action -> action != null).toList();
+        if (actions.isEmpty()) {
+            return;
+        }
+        editGuard.run(() -> actions.forEach(UndoableAction::redo));
+        ControllerFactory.getController().getUndoManager().addAction(new UndoableAction() {
+            @Override
+            public void redo() {
+                actions.forEach(UndoableAction::redo);
+            }
+
+            @Override
+            public void undo() {
+                actions.forEach(UndoableAction::undo);
+            }
+        });
+    }
+
+    /**
+     * Shows each font family in its own face so the list can be browsed by look.
+     */
+    private static final class FontListCell extends ListCell<String> {
+        @Override
+        protected void updateItem(String family, boolean empty) {
+            super.updateItem(family, empty);
+            if (empty || family == null) {
+                setText(null);
+                setFont(Font.getDefault());
+                return;
+            }
+            setText(family);
+            setFont(Font.font(family, Font.getDefault().getSize()));
+        }
+    }
+
+    private EntitySettingsRowGroup buildPositionGroup(TransformTarget target, DoubleProperty labelWidth) {
+        List<Entity> entities = target.entities;
+        UnitTextField xField = controls.doubleField(
+                e -> e.getPosition(positionAnchor).getX(),
+                (entity, v) -> entity.setPosition(positionAnchor,
+                        new java.awt.geom.Point2D.Double(v, entity.getPosition(positionAnchor).getY())),
+                entities, Unit.MM, target.moveUndo(true));
+
+        UnitTextField yField = controls.doubleField(
+                e -> e.getPosition(positionAnchor).getY(),
+                (entity, v) -> entity.setPosition(positionAnchor,
+                        new java.awt.geom.Point2D.Double(entity.getPosition(positionAnchor).getX(), v)),
+                entities, Unit.MM, target.moveUndo(false));
+
+        // Changing the anchor only changes which point X/Y refer to; the entity does not move, so
+        // just refresh the displayed values to the new reference point.
+        AnchorSelector anchorSelector = new AnchorSelector();
+        anchorSelector.setAnchor(positionAnchor);
+        anchorSelector.anchorProperty().addListener((obs, oldAnchor, newAnchor) -> {
+            positionAnchor = newAnchor;
+            refreshFieldValue(xField, entities, e -> e.getPosition(newAnchor).getX());
+            refreshFieldValue(yField, entities, e -> e.getPosition(newAnchor).getY());
+        });
+
+        EntitySettingsRow xRow = new EntitySettingsRow(labelWidth, EntitySetting.POSITION_X.getLabel(), xField);
+        EntitySettingsRow yRow = new EntitySettingsRow(labelWidth, EntitySetting.POSITION_Y.getLabel(), yField);
+        return new EntitySettingsRowGroup(anchorSelector, xRow, yRow);
+    }
+
+    private EntitySettingsRowGroup buildRotationGroup(TransformTarget target, DoubleProperty labelWidth) {
+        UnitTextField rotationField = controls.doubleField(Entity::getRotation, Entity::setRotation,
+                target.entities, Unit.DEGREE, target.rotateUndo());
+        EntitySettingsRow rotationRow = new EntitySettingsRow(labelWidth, EntitySetting.ROTATION.getLabel(), rotationField);
+
+        HBox flipButtons = new HBox(4,
+                createFlipButton(new DesignFlipHorizontalAction()),
+                createFlipButton(new DesignFlipVerticalAction()));
+        flipButtons.setAlignment(Pos.CENTER_LEFT);
+        return new EntitySettingsRowGroup(flipButtons, rotationRow);
+    }
+
+    private ActionButton createFlipButton(Action action) {
+        ActionButton button = new ActionButton(action, 16, false);
+        button.getStyleClass().add("flip-button");
+        return button;
+    }
+
+    private void refreshFieldValue(UnitTextField field, List<Entity> entities, ToDoubleFunction<Entity> getter) {
+        editGuard.run(() -> field.setValue(getter.applyAsDouble(entities.getFirst())));
+    }
+
+    private EntitySettingsRowGroup buildSizeGroup(TransformTarget target, DoubleProperty labelWidth) {
+        List<Entity> entities = target.entities;
+        captureAspectRatios(entities);
+
+        UnitTextField widthField = controls.doubleField(
+                e -> e.getSize().getWidth(),
+                (entity, v) -> applySize(entity, v, true),
+                entities, Unit.MM, target.resizeUndo(true));
+
+        UnitTextField heightField = controls.doubleField(
+                e -> e.getSize().getHeight(),
+                (entity, v) -> applySize(entity, v, false),
+                entities, Unit.MM, target.resizeUndo(false));
+
+        // When locked, editing one dimension resizes the other in the model. Mirror that change in
+        // the sibling field so its displayed value stays correct while typing.
+        widthField.unitValueProperty().addListener((obs, oldVal, newVal) ->
+                syncSibling(heightField, e -> e.getSize().getHeight(), entities));
+        heightField.unitValueProperty().addListener((obs, oldVal, newVal) ->
+                syncSibling(widthField, e -> e.getSize().getWidth(), entities));
+
+        EntitySettingsRow widthRow = new EntitySettingsRow(labelWidth, EntitySetting.WIDTH.getLabel(), widthField);
+        EntitySettingsRow heightRow = new EntitySettingsRow(labelWidth, EntitySetting.HEIGHT.getLabel(), heightField);
+        return new EntitySettingsRowGroup(createAspectRatioLock(entities), widthRow, heightRow);
+    }
+
+    private ToggleButton createAspectRatioLock(List<Entity> entities) {
+        ToggleButton toggle = new ToggleButton();
+        toggle.getStyleClass().add("aspect-ratio-lock");
+        toggle.setMaxHeight(Double.MAX_VALUE);
+        SvgLoader.loadImageIcon("icons/lock.svg", 16, Colors.BLACKISH).ifPresent(toggle::setGraphic);
+
+        Tooltip tooltip = new Tooltip("Lock aspect ratio");
+        tooltip.setShowDelay(Duration.millis(100));
+        toggle.setTooltip(tooltip);
+
+        // The toggle is recreated on every rebuild, so keep the on/off state on the panel and just
+        // reflect it here. A one-way listener (living on the toggle, not the panel property) avoids
+        // leaking listeners across rebuilds. Re-capture the ratios whenever it is switched on so it
+        // uses the sizes as they currently are.
+        toggle.setSelected(aspectRatioLocked.get());
+        toggle.selectedProperty().addListener((obs, wasSelected, isSelected) -> {
+            aspectRatioLocked.set(isSelected);
+            if (isSelected) {
+                captureAspectRatios(entities);
+            }
+        });
+        return toggle;
+    }
+
+    private void captureAspectRatios(List<Entity> entities) {
+        aspectRatios.clear();
+        for (Entity entity : entities) {
+            double width = entity.getSize().getWidth();
+            if (width > 0) {
+                aspectRatios.put(entity, entity.getSize().getHeight() / width);
+            }
+        }
+    }
+
+    private void applySize(Entity entity, double value, boolean isWidth) {
+        Size size = entity.getSize();
+        Double ratio = aspectRatios.get(entity);
+        if (aspectRatioLocked.get() && ratio != null && ratio > 0) {
+            entity.setSize(isWidth ? new Size(value, value * ratio) : new Size(value / ratio, value));
+        } else if (isWidth) {
+            entity.setSize(new Size(value, size.getHeight()));
+        } else {
+            entity.setSize(new Size(size.getWidth(), value));
+        }
+    }
+
+    private void syncSibling(UnitTextField sibling, ToDoubleFunction<Entity> getter, List<Entity> entities) {
+        if (editGuard.isActive() || !aspectRatioLocked.get()) {
+            return;
+        }
+        editGuard.run(() -> sibling.setValue(getter.applyAsDouble(entities.getFirst())));
+    }
+
+    private Region buildControl(EntitySetting key, List<Cuttable> entities) {
+        return switch (key) {
+            case POSITION_X -> controls.doubleField(
+                    e -> e.getPosition().getX(),
+                    (entity, v) -> entity.setPosition(new java.awt.geom.Point2D.Double(v, entity.getPosition().getY())),
+                    entities, Unit.MM);
+            case POSITION_Y -> controls.doubleField(
+                    e -> e.getPosition().getY(),
+                    (entity, v) -> entity.setPosition(new java.awt.geom.Point2D.Double(entity.getPosition().getX(), v)),
+                    entities, Unit.MM);
+            case WIDTH -> controls.doubleField(
+                    e -> e.getSize().getWidth(),
+                    (entity, v) -> entity.setSize(new Size(v, entity.getSize().getHeight())),
+                    entities, Unit.MM);
+            case HEIGHT -> controls.doubleField(
+                    e -> e.getSize().getHeight(),
+                    (entity, v) -> entity.setSize(new Size(entity.getSize().getWidth(), v)),
+                    entities, Unit.MM);
+            case ROTATION -> controls.doubleField(Cuttable::getRotation, Cuttable::setRotation, entities, Unit.DEGREE);
+            case CORNER_RADIUS -> controls.doubleField(
+                    e -> e.getEntitySetting(EntitySetting.CORNER_RADIUS).map(s -> (Double) s).orElse(0d),
+                    (entity, v) -> entity.setEntitySetting(EntitySetting.CORNER_RADIUS, v),
+                    entities.stream().filter(e -> e instanceof Rectangle).toList(), Unit.MM);
+            case CUT_TYPE -> cutTypeControl(entities);
+            case START_DEPTH ->
+                    controls.doubleField(Cuttable::getStartDepth, Cuttable::setStartDepth, entities, Unit.MM);
+            case TARGET_DEPTH ->
+                    controls.doubleField(Cuttable::getTargetDepth, Cuttable::setTargetDepth, entities, Unit.MM);
+            case SPINDLE_SPEED ->
+                    controls.intField(Cuttable::getSpindleSpeed, Cuttable::setSpindleSpeed, entities, Unit.PERCENT);
+            case FEED_RATE ->
+                    controls.intField(Cuttable::getFeedRate, Cuttable::setFeedRate, entities, Unit.METERS_PER_SECOND);
+            case PASSES -> controls.intField(Cuttable::getPasses, Cuttable::setPasses, entities, Unit.TIMES);
+            case LEAD_IN_PERCENT ->
+                    controls.intField(Cuttable::getLeadInPercent, Cuttable::setLeadInPercent, entities, Unit.PERCENT);
+            case TOOL_PATH_ANGLE ->
+                    controls.doubleField(Cuttable::getToolPathAngle, Cuttable::setToolPathAngle, entities, Unit.DEGREE);
+            case DIRECTION -> controls.enumCombo(Direction.values(), Direction::getLabel,
+                    Cuttable::getDirection, Cuttable::setDirection, entities);
+            case TOOL_PATH_DIRECTION -> controls.enumCombo(ToolPathDirection.values(),
+                    ToolPathDirection::getLabel, Cuttable::getToolPathDirection, Cuttable::setToolPathDirection, entities);
+            case PLUNGE_TYPE -> controls.enumCombo(availablePlungeTypes(entities), PlungeType::getLabel,
+                    Cuttable::getPlungeType, Cuttable::setPlungeType, entities);
+            case FINISHING_PASS ->
+                    leftAligned(controls.switchControl(Cuttable::isFinishingPass, Cuttable::setFinishingPass, entities));
+            case STOCK_TO_LEAVE ->
+                    controls.doubleField(Cuttable::getStockToLeave, Cuttable::setStockToLeave, entities, Unit.MM);
+            case LINE_SPACING ->
+                    controls.doubleField(Cuttable::getLineSpacing, Cuttable::setLineSpacing, entities, Unit.MM);
+            case TABS -> tabsControl(entities);
+            case TAB_COUNT -> controls.intField(Cuttable::getTabCount, Cuttable::setTabCount, entities, Unit.TIMES);
+            default -> null;
+        };
+    }
+
+    /**
+     * The plunge types supported by every selected entity, so we never set one that the cut type of
+     * an entity can not be cut with.
+     */
+    private static PlungeType[] availablePlungeTypes(List<Cuttable> entities) {
+        Set<PlungeType> available = new LinkedHashSet<>(entities.getFirst().getCutType().getPlungeTypes());
+        entities.forEach(entity -> available.retainAll(entity.getCutType().getPlungeTypes()));
+        return available.toArray(new PlungeType[0]);
+    }
+
+    private static Region leftAligned(Region control) {
+        HBox box = new HBox(control);
+        box.setAlignment(Pos.CENTER_LEFT);
+        return box;
+    }
+
+    /**
+     * Turning the tabs off leaves nothing to spread out, so the number of tabs is only shown when
+     * they are on. That means the rows have to be rebuilt when the switch is flipped.
+     */
+    private Region tabsControl(List<Cuttable> entities) {
+        SwitchButton control = controls.switchControl(Cuttable::hasTabs, Cuttable::setTabs, entities);
+        control.selectedProperty().addListener((obs, wasSelected, isSelected) -> Platform.runLater(this::rebuild));
+        return leftAligned(control);
+    }
+
+    private ComboBox<CutType> cutTypeControl(List<Cuttable> entities) {
+        ComboBox<CutType> combo = controls.cutTypeCombo(entities);
+        // The cut type determines which cut settings apply, so rebuild the rows when it changes.
+        // The value is applied by the factory's own listener (under the edit guard, which suppresses
+        // the entity-change rebuild), so we trigger the structural rebuild explicitly here.
+        combo.valueProperty().addListener((obs, oldType, newType) -> {
+            if (newType != null && newType != oldType) {
+                Platform.runLater(this::rebuild);
+            }
+        });
+        return combo;
+    }
+
+    /**
+     * What the transform fields read and write. For a single entity that is the entity itself and
+     * the default undo, which sets the value back, is fine. For the selection as a whole the undo
+     * actions are recorded against the entities that were selected, as the selection may have
+     * changed by the time the edit is undone.
+     */
+    private final class TransformTarget {
+        private final List<Entity> entities;
+        private final List<Entity> selected;
+
+        TransformTarget(Entity target, List<Entity> selected) {
+            this.entities = List.of(target);
+            this.selected = selected;
+        }
+
+        EntitySettingsControlFactory.UndoRecorder<Entity> moveUndo(boolean isX) {
+            if (selected == null) {
+                return null;
+            }
+            return (targets, before, value) -> {
+                double delta = value - before.get(targets.get(0));
+                return new MoveAction(selected, isX ? new java.awt.geom.Point2D.Double(delta, 0) : new java.awt.geom.Point2D.Double(0, delta));
+            };
+        }
+
+        EntitySettingsControlFactory.UndoRecorder<Entity> rotateUndo() {
+            if (selected == null) {
+                return null;
+            }
+            return (targets, before, value) -> {
+                Entity target = targets.getFirst();
+                return new RotateAction(selected, target.getCenter(), value - before.get(target));
+            };
+        }
+
+        EntitySettingsControlFactory.UndoRecorder<Entity> resizeUndo(boolean isWidth) {
+            if (selected == null) {
+                return null;
+            }
+            return (targets, before, value) -> {
+                Entity target = targets.getFirst();
+                Size after = target.getSize();
+                double original = before.get(target);
+                Double ratio = aspectRatios.get(target);
+                boolean locked = aspectRatioLocked.get() && ratio != null && ratio > 0;
+                Size originalSize = isWidth
+                        ? new Size(original, locked ? original * ratio : after.getHeight())
+                        : new Size(locked ? original / ratio : after.getWidth(), original);
+                return new ResizeAction(selected, Anchor.BOTTOM_LEFT, originalSize, after);
+            };
+        }
+    }
+}
